@@ -89,8 +89,7 @@ def save_simulation_results(
             colors = ["black" if dot[2] == "0" else "blue" for dot in gate_info]
 
             plt.figure(figsize=(6, 6))
-            for x, y, c in zip(x_coords, y_coords, colors):
-                plt.scatter(x, y, color=c, s=60, edgecolors="none")
+            plt.scatter(x_coords, y_coords, c=colors, s=60, edgecolors="none")
             plt.gca().invert_yaxis()
             plt.axis("off")
             plt.tight_layout()

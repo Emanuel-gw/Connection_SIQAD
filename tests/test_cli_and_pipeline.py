@@ -1,4 +1,5 @@
 import csv
+import itertools
 import json
 import os
 import subprocess
@@ -6,8 +7,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from source import cli, exporter, pipeline
+from source import cli, corrector, exporter, implementation, pipeline, sqd_manipulator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -404,6 +406,164 @@ class TestResolutionAndPipeline(unittest.TestCase):
             configs = list(Path(tmpdir).rglob("simulation_config.txt"))
             self.assertEqual(len(configs), 1)
             self.assertIn("clustercomplete", configs[0].read_text().lower())
+
+
+class TestFixesAndRegressionGuards(unittest.TestCase):
+    def setUp(self):
+        self._orig_cwd = os.getcwd()
+        os.chdir(PROJECT_ROOT)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+
+    def test_call_sim_timeout_and_nonzero_exit(self):
+        with self.assertRaises(TimeoutError):
+            implementation.call_sim(
+                "unused_in", "unused_out", simulator="sleep 2 #", timeout=0.1
+            )
+
+        with self.assertRaises(RuntimeError):
+            implementation.call_sim(
+                "unused_in", "unused_out", simulator="false #", timeout=5
+            )
+
+    def test_pruned_valid_combo_generator_matches_cartesian_product_exactly(self):
+        files = [
+            pipeline.resolve_gate_path("./data/sqd/AND"),
+            pipeline.resolve_gate_path("./data/sqd/OR"),
+            pipeline.resolve_gate_path("./data/sqd/INPUT"),
+        ]
+        for max_gates in (1, 2, 3):
+            expected = [
+                combo
+                for r in range(1, 2 * max_gates)
+                for combo in itertools.product(files, repeat=r)
+                if pipeline.is_valid_combo(combo, max_gates)
+            ]
+            actual = list(pipeline._iter_valid_combos(files, max_gates))
+            self.assertEqual(actual, expected)
+
+    def test_main_operator_cache_returns_isolated_copies(self):
+        and_path = pipeline.resolve_gate_path("./data/sqd/AND")
+        g1 = sqd_manipulator.main_operator(and_path)
+        original_count = len(g1.db_dots)
+        g1.db_dots.pop()
+        g2 = sqd_manipulator.main_operator(and_path)
+        self.assertEqual(len(g2.db_dots), original_count)
+
+    def test_read_result_returns_lowest_energy_not_last(self):
+        and_path = pipeline.resolve_gate_path("./data/sqd/AND")
+        gate = sqd_manipulator.main_operator(and_path)
+        out_x = gate.output_dot.physloc["x"]
+        out_y = gate.output_dot.physloc["y"]
+
+        xml_content = f"""<?xml version="1.0" encoding="utf-8"?>
+<sim_out>
+    <physloc>
+        <dbdot x="{out_x}" y="{out_y}"/>
+    </physloc>
+    <elec_dist>
+        <dist energy="-1.5" count="5" physically_valid="1" state_count="1">-</dist>
+        <dist energy="-0.25" count="2" physically_valid="1" state_count="1">0</dist>
+    </elec_dist>
+</sim_out>
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as tf:
+            tf.write(xml_content)
+            tmp_xml = tf.name
+
+        try:
+            symbols_out, energy = sqd_manipulator.read_result(tmp_xml, gate)
+            self.assertEqual(symbols_out, ["1"])
+            self.assertEqual(energy, -1.5)
+        finally:
+            os.remove(tmp_xml)
+
+    def test_up_correction_clear_occupied_and_far_dot_no_regressions(self):
+        g_and = pipeline.resolve_gate_path("./data/sqd/AND")
+        conn = pipeline.connect_gates([g_and, g_and], wire_length=1, strategy="FIFO")
+        gate = conn.gate
+        meta = gate.gate_metadata[0]
+        meta["stabilizers"] = []
+
+        # Compute boundaries matching correction_function
+        pts = []
+        for pos in meta["inputs"]:
+            pts.append(sqd_manipulator.Gate.from_dict(gate.to_dict()).pivot_dot.physloc)
+        gate_boundaries_pts = [
+            (pos[0] * 3.84, pos[1] * 7.68 + pos[2] * 2.25)
+            for pos in meta["inputs"] + [meta["center"]]
+        ]
+        boundaries = corrector.calculate_boundaries(gate_boundaries_pts)
+
+        # Case 1: Clear top area -> adds top stabilizer and returns gate
+        initial_dots = len(gate.db_dots)
+        updated_gate = corrector.up_correction(gate, meta, boundaries)
+        self.assertIsNotNone(updated_gate)
+        self.assertEqual(len(updated_gate.db_dots), initial_dots + 1)
+        self.assertEqual(len(meta["stabilizers"]), 1)
+
+        # Case 2: Occupied top area (the stabilizer we just added is now in the area!)
+        # Must detect collision, skip adding another top dot, and STILL return gate (not None)
+        dots_before_occupied = len(updated_gate.db_dots)
+        updated_again = corrector.up_correction(updated_gate, meta, boundaries)
+        self.assertIsNotNone(updated_again)
+        self.assertEqual(len(updated_again.db_dots), dots_before_occupied)
+        self.assertEqual(len(meta["stabilizers"]), 1)
+
+        # Case 3: Distant dot far above the clearance zone should NOT block top stabilizer
+        conn2 = pipeline.connect_gates([g_and], wire_length=1, strategy="FIFO")
+        gate2 = conn2.gate
+        meta2 = gate2.gate_metadata[0]
+        meta2["stabilizers"] = []
+        gate2.add_dot(NML=(meta2["center"][0], meta2["original_inputs"][0][1] - 10, 0))
+        b2_pts = [
+            (pos[0] * 3.84, pos[1] * 7.68 + pos[2] * 2.25)
+            for pos in meta2["inputs"] + [meta2["center"]]
+        ]
+        b2 = corrector.calculate_boundaries(b2_pts)
+        dots_before_far = len(gate2.db_dots)
+        res2 = corrector.up_correction(gate2, meta2, b2)
+        self.assertIsNotNone(res2)
+        self.assertEqual(len(res2.db_dots), dots_before_far + 1)
+        self.assertEqual(len(meta2["stabilizers"]), 1)
+
+    def test_batch_failed_simulation_does_not_poison_saved_expressions(self):
+        g_and = pipeline.resolve_gate_path("./data/sqd/AND")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_failed = pipeline.SimulationResult(
+                gate=sqd_manipulator.main_operator(g_and),
+                table_data=[{"result": "", "expected": "", "file_id": "", "energy": ""}],
+                specific_gate_data=[],
+                has_mismatches=True,
+                failed=True,
+                simulator_path="data/simulators/simanneal/simanneal.physeng",
+                simulator_config={},
+            )
+            with mock.patch.object(pipeline, "run_simulation", return_value=fake_failed):
+                res = pipeline.run_batch_simulation(
+                    gate_files=[g_and],
+                    max_gates=1,
+                    output_dir=tmpdir,
+                    cooldown=False,
+                )
+
+            self.assertFalse(res["expressions_file"].exists())
+            with open(res["summary_csv"], "r") as f:
+                rows = list(csv.DictReader(f))
+            error_rows = [r for r in rows if r["RowType"] == "ERROR"]
+            self.assertEqual(len(error_rows), 1)
+
+            # Resuming now must NOT skip the previously failed combo
+            res_retry = pipeline.run_batch_simulation(
+                gate_files=[g_and],
+                max_gates=1,
+                output_dir=tmpdir,
+                max_corrections=0,
+                cooldown=False,
+            )
+            self.assertEqual(res_retry["simulated_in_run"], 1)
+            self.assertTrue(res_retry["expressions_file"].is_file())
 
 
 class TestWebUIStartupIntegrity(unittest.TestCase):

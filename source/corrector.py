@@ -277,26 +277,42 @@ def up_correction(gate, metadata, gate_boundaries):
         #We could check if the gate is triggering when only one input is active, this is also easier to check
         #print("Gate Boundaries:", gate_boundaries)
         min_x, max_x, min_y, max_y = gate_boundaries
-        #Check if there are any DBs on top of the gate boundaries
+        N, _, _ = metadata.get("center")
+        L = 0
+        original_inputs = metadata.get("original_inputs") or []
+        if original_inputs:
+            orig_xy = [classes.calculate_xy(p[0], p[1], p[2]) for p in original_inputs]
+            center_xy = classes.calculate_xy(*metadata.get("center"))
+            gate_min_x = min(pt[0] for pt in orig_xy + [center_xy])
+            gate_max_x = max(pt[0] for pt in orig_xy + [center_xy])
+            top_y = min(pt[1] for pt in orig_xy)
+            target_m = original_inputs[0][1] - 2
+        else:
+            gate_min_x, gate_max_x, top_y = min_x, max_x, min_y
+            target_m = metadata.get("center")[1] - 2
+        _, target_y = classes.calculate_xy(N, target_m, L)
+
+        # Check if there are any DBs directly above THIS gate's own footprint in the
+        # target stabilizer clearance zone (y decreases going upward in SiQAD coordinates).
+        upper_bound_y = target_y - 15.36  # 2 lattice rows of clearance above stabilizer
         dbs_in_area = []
         for dot in gate.db_dots:
-            if dot.physloc['x'] < min_x and dot.physloc['x'] > max_x and dot.physloc['y'] < min_y and dot.physloc['y'] > max_y:
+            x = dot.physloc['x']
+            y = dot.physloc['y']
+            if gate_min_x <= x <= gate_max_x and upper_bound_y <= y < top_y:
                 dbs_in_area.append(dot)
         #print("DBs in Gate Area:", dbs_in_area)
         # If there are DBs in the area, we have to add to the side, otherwise, we add on top
         if len(dbs_in_area) > 0:
-            print("Adding stabilizers to the side of the gate.")
-            #Add stabilizers to one side of the gate.
+            print("Adding stabilizers to the side of the gate (top area occupied; skipping top stabilizer).")
+            # Side-stabilizer placement not yet implemented; return gate unchanged to avoid corrupting state.
+            return gate
         elif len(dbs_in_area) == 0:
             print("Adding stabilizers on top of the gate.")
             #Add stabilizers on top of the gate, in the middle. At least one in the middle.
-            N, M, L = metadata.get("center")
-            L = 0
-            #Shift up until after the inputs
-            M = metadata.get("original_inputs")[0][1] - 2
-            gate.add_dot(NML=(N, M, L))
-            print("Added stabilizer at N:", N, " M:", M, " L:", L)
-            metadata["stabilizers"].append((N, M, L))
+            gate.add_dot(NML=(N, target_m, L))
+            print("Added stabilizer at N:", N, " M:", target_m, " L:", L)
+            metadata["stabilizers"].append((N, target_m, L))
             return gate
         
 def AND_correction(gate, metadata, expected_output, sim_output_value, gate_boundaries):

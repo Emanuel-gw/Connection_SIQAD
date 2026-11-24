@@ -330,6 +330,7 @@ def _simulate_internal(
     expected,
     max_mismatches=1,
     verbose=True,
+    sim_timeout=None,
 ):
     corrections_needed = False
     results = []
@@ -372,6 +373,7 @@ def _simulate_internal(
                     result_name,
                     simulator=sim_exec,
                     simmaneal_default_path=sim_exec,
+                    timeout=sim_timeout,
                 )
                 symbol_table, energy = sqd_manipulator.read_result(result_path, gate)
                 specific_gate_data.append(sqd_manipulator.read_result_plusXY(result_path, gate))
@@ -412,6 +414,7 @@ def run_simulation(
     max_mismatches=1,
     pad_page_size=20,
     verbose=True,
+    sim_timeout=None,
 ):
     """Run truth-table simulation and optional stabilization corrections on a Gate."""
     if not gate:
@@ -460,6 +463,7 @@ def run_simulation(
             expected,
             max_mismatches=max_mismatches,
             verbose=verbose,
+            sim_timeout=sim_timeout,
         )
         if failed:
             break
@@ -539,6 +543,7 @@ def run_pipeline(
     max_corrections=0,
     max_mismatches=1,
     config_overrides=None,
+    sim_timeout=None,
 ):
     """Execute the full headless pipeline: resolve -> connect -> simulate -> save."""
     resolved_gates = [resolve_gate_path(g) for g in gate_inputs]
@@ -559,6 +564,7 @@ def run_pipeline(
         max_mismatches=max_mismatches,
         pad_page_size=20,
         verbose=True,
+        sim_timeout=sim_timeout,
     )
 
     if sim_result.failed:
@@ -594,43 +600,72 @@ def canonicalize_expression(expr):
     return expr.xreplace(mapping)
 
 
+def _iter_valid_combos(gate_files, max_gates):
+    """Yield all valid gate combinations up to `max_gates` non-INPUT gates in length order.
+
+    Prunes invalid prefixes (INPUT root, slot exhaustion, > max_gates) during generation
+    instead of enumerating the full cartesian product.
+    """
+    input_name = "INPUT.sqd"
+    max_len = 2 * max_gates
+    indexed_files = [(g, os.path.basename(str(g)) == input_name) for g in gate_files]
+
+    def _recurse(target_len, prefix, available_slots, non_input_count):
+        if len(prefix) == target_len:
+            yield tuple(prefix)
+            return
+
+        if available_slots <= 0:
+            return
+
+        is_root = len(prefix) == 0
+        for gate_path, is_input in indexed_files:
+            if is_root and is_input:
+                continue
+            next_non_input = non_input_count if is_input else non_input_count + 1
+            if next_non_input > max_gates:
+                continue
+            next_slots = available_slots - 1 + (0 if is_input else 2)
+            prefix.append(gate_path)
+            yield from _recurse(target_len, prefix, next_slots, next_non_input)
+            prefix.pop()
+
+    for length in range(1, max_len):
+        yield from _recurse(length, [], 1, 0)
+
+
 def generate_unique_batch_combos(gate_files, max_gates, wire_length=1, strategy="FIFO"):
     """Generate valid, logically unique gate combinations up to `max_gates` non-INPUT gates."""
     strategy_norm = (strategy or "FIFO").strip().upper()
-    max_len = 2 * max_gates
     seen = set()
     unique_combos = []
     generator_unique_expressions = {}
 
-    for r in range(1, max_len):
-        for combo in product(gate_files, repeat=r):
-            if not is_valid_combo(combo, max_gates):
-                continue
+    for combo in _iter_valid_combos(gate_files, max_gates):
+        norm = tuple(os.path.basename(str(g)) for g in combo)
+        if norm in seen:
+            continue
 
-            norm = tuple(os.path.basename(str(g)) for g in combo)
-            if norm in seen:
-                continue
+        try:
+            circuit, _, _, _ = gate_connector.connect_n_gates(
+                combo, wires=wire_length, strategy=strategy_norm
+            )
+        except ValueError as exc:
+            if strategy_norm == "CORNER":
+                raise NotImplementedError(
+                    "Connector strategy 'CORNER' is not implemented in gate_connector.connect_n_gates yet. "
+                    "Supported strategy: FIFO."
+                ) from exc
+            raise
 
-            try:
-                circuit, _, _, _ = gate_connector.connect_n_gates(
-                    combo, wires=wire_length, strategy=strategy_norm
-                )
-            except ValueError as exc:
-                if strategy_norm == "CORNER":
-                    raise NotImplementedError(
-                        "Connector strategy 'CORNER' is not implemented in gate_connector.connect_n_gates yet. "
-                        "Supported strategy: FIFO."
-                    ) from exc
-                raise
+        gate = sqd_manipulator.circuit_to_gate(circuit)
+        expr_key = canonicalize_expression(gate.expression)
+        if expr_key in generator_unique_expressions:
+            continue
 
-            gate = sqd_manipulator.circuit_to_gate(circuit)
-            expr_key = canonicalize_expression(gate.expression)
-            if expr_key in generator_unique_expressions:
-                continue
-
-            generator_unique_expressions[expr_key] = True
-            seen.add(norm)
-            unique_combos.append(combo)
+        generator_unique_expressions[expr_key] = True
+        seen.add(norm)
+        unique_combos.append(combo)
 
     return unique_combos
 
@@ -647,6 +682,7 @@ def run_batch_simulation(
     max_corrections=5,
     max_mismatches=1,
     cooldown=True,
+    sim_timeout=None,
 ):
     """Run full Auto Batch simulation with expression deduplication, CSV logging, and resume.
 
@@ -790,8 +826,6 @@ def run_batch_simulation(
                 )
                 continue
 
-            gate_unique_expressions[gate.expression] = True
-
             sim_result = run_simulation(
                 gate,
                 simulator=sim_physeng,
@@ -800,6 +834,7 @@ def run_batch_simulation(
                 max_mismatches=max_mismatches,
                 pad_page_size=20,
                 verbose=False,
+                sim_timeout=sim_timeout,
             )
 
             total_combinations += 1
@@ -824,8 +859,10 @@ def run_batch_simulation(
             csv_writer.writerow(csv_row)
             csv_file.flush()
 
-            with open(expressions_file, "w") as f:
-                json.dump({str(k): True for k in gate_unique_expressions.keys()}, f)
+            if not sim_result.failed:
+                gate_unique_expressions[gate.expression] = True
+                with open(expressions_file, "w") as f:
+                    json.dump({str(k): True for k in gate_unique_expressions.keys()}, f)
 
             gate_name = gate.name if gate.name else f"unnamed_gate{str(combo)}"
             num_gates_dir = (

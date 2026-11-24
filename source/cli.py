@@ -113,6 +113,13 @@ def build_parser():
             "custom_sim_params.xml (repeatable, e.g. --sim-param muzm=-0.28)."
         ),
     )
+    parser.add_argument(
+        "--sim-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Optional per-simulation timeout in seconds before retrying/failing.",
+    )
     return parser
 
 
@@ -145,6 +152,9 @@ def parse_args(argv=None):
 
         if args.max_mismatches < 1:
             parser.error("--max-mismatches must be >= 1.")
+
+        if args.sim_timeout is not None and args.sim_timeout <= 0:
+            parser.error("--sim-timeout must be > 0.")
 
         if args.sim_param:
             try:
@@ -179,6 +189,7 @@ def run_cli(argv=None):
                 max_corrections=args.fixes,
                 max_mismatches=args.max_mismatches,
                 cooldown=True,
+                sim_timeout=args.sim_timeout,
             )
             print("CLI batch pipeline completed.")
             print(f"Summary CSV: {result['summary_csv']}")
@@ -194,6 +205,7 @@ def run_cli(argv=None):
             max_corrections=args.fixes,
             max_mismatches=args.max_mismatches,
             config_overrides=args.sim_param_overrides or None,
+            sim_timeout=args.sim_timeout,
         )
     except (FileNotFoundError, ValueError, NotImplementedError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

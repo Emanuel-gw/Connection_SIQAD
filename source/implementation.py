@@ -48,18 +48,32 @@ def tabulate_to_dash(headers, rows):
     cleaned_data = [[cell[0] if isinstance(cell, list) else cell for cell in row] for row in rows]
     return tabulate(cleaned_data, headers=headers, tablefmt="html")
 
-def call_sim(file, result_name, simulator=None, simmaneal_default_path=None):    
+def call_sim(file, result_name, simulator=None, simmaneal_default_path=None, timeout=None):    
     if simulator is None:
         sim = simmaneal_default_path
     else:
         sim = simulator
 
     result_path = Path("data") / "xml" / result_name
-    command = sim + " " + file + " " + str(result_path)
+    command = str(sim) + " " + str(file) + " " + str(result_path)
     #print("Simulating: " + file)
     #print(command)
     sys.stdout.flush()
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Simulator '{sim}' timed out after {timeout}s on '{file}'."
+        ) from exc
     sys.stdout.flush()
-    #print(result.stdout)
+    if result.returncode != 0:
+        err_detail = (result.stderr or result.stdout or "").strip()
+        if len(err_detail) > 300:
+            err_detail = err_detail[:300] + "..."
+        raise RuntimeError(
+            f"Simulator '{sim}' exited with code {result.returncode} on '{file}'"
+            + (f": {err_detail}" if err_detail else "")
+        )
     return result_path

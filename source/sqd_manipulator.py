@@ -122,7 +122,17 @@ def shift_gate_dots(gate, shiftn, shiftm):
     return gate
     
         
+_GATE_CACHE = {}
+
+
 def main_operator(file):
+    abs_path = os.path.abspath(file)
+    mtime_ns = os.stat(abs_path).st_mtime_ns
+    cache_key = (abs_path, mtime_ns)
+    cached = _GATE_CACHE.get(cache_key)
+    if cached is not None:
+        return deepcopy(cached)
+
     dots = parse_sqd_file(file)
         
     dots, pivot_dot = set_dots_to_minimum(dots)
@@ -134,7 +144,8 @@ def main_operator(file):
         name = file.split("\\")[-1]
     name = name.split(".")[0]
     gate = Gate(dots, pivot_dot, perturbers,output_dot, name)
-    return gate
+    _GATE_CACHE[cache_key] = gate
+    return deepcopy(gate)
     
 def circuit_to_gate(circuit):
     db_dots = []
@@ -261,6 +272,9 @@ def read_result(file, gate):
             biggest = [energy, count, physically_valid, state_count, symbol]
             lowest_energy = energy
     
+    if not biggest:
+        raise ValueError(f"No physically valid state found in simulation result: {file}")
+
     symbol = biggest[4]
     symbol_list = []
 
@@ -272,5 +286,5 @@ def read_result(file, gate):
         if symbol == "-":
             symbol_list[symbol_list.index(symbol)] = "1"
 
-    return symbol_list, energy
+    return symbol_list, lowest_energy
     
