@@ -1,16 +1,5 @@
-import dash
-from dash import clientside_callback, html, dcc, callback, Input, Output, State, dash_table, ctx, ALL
-import plotly.express as px
-import plotly.graph_objects as go
-import pandas as pd
-import numpy as np
-import dash_bootstrap_components as dbc
-from source import file_manager, sqd_manipulator, gate_connector, StreamCapture, implementation
-from source.plotting import plot_NML, get_top_size, get_bottom_size, get_viewport, viewport_size, plot_XY
-import os
-import time
-from dash import ClientsideFunction
-from pathlib import Path
+from dash import html, dcc, callback, Input, Output, State, ALL
+from source import pipeline
 
 layout = html.Div([
     dcc.Store(id='config-sim-store', data={}),
@@ -49,30 +38,11 @@ def build_config_ui(params):
     Input('current-sim-store', 'data')
 )
 def update_config_ui(file):
-    #Check if the current sim has a Custom_sim_params.xml file, if so load it and return it.
+    # Check if the current sim has a custom_sim_params.xml file, if so load and merge it.
     if file is None:
         return html.Div("No simulator selected.")
-    #print(file)
-    # Parse the physeng file to get the parameters
-    params = file_manager.parse_physeng(file)
 
-    # Load existing custom_sim_params.xml if it exists
-    current_sim_folder = Path(file).parent
-    config_file_path = current_sim_folder / "custom_sim_params.xml"
-    custom_params = {}
-    if config_file_path.is_file():
-        try:
-            with open(config_file_path, "r") as f:
-                content = f.read()
-                custom_params = eval(content)
-        except Exception as e:
-            print(f"Error reading custom_sim_params.xml: {e}")
-            custom_params = {}
-
-    # Override default values with custom ones
-    for key, value in custom_params.items():
-        if key in params:
-            params[key]['val'] = value
+    params = pipeline.get_simulator_params(file)
 
     children = []
     row_children = []
@@ -133,31 +103,12 @@ def update_config_ui(file):
 )
 def apply_config(n_clicks, values, ids, current_sim, sim_value):
     if not n_clicks:
-        #Check if the current sim has a Custom_sim_params.xml file, if so load it and return it.
-        if current_sim is None:
-            return {}
-        current_sim_folder = Path(current_sim).parent
-        config_file_path = current_sim_folder / "custom_sim_params.xml"
-        if config_file_path.is_file():
-            with open(config_file_path, "r") as f:
-                content = f.read()
-                try:
-                    config = eval(content)
-                except Exception as e:
-                    print(f"Error reading custom_sim_params.xml: {e}")
-                    config = {}
-        else:
-            config = {}
-        return config
+        return pipeline.load_simulator_config(current_sim)
 
     # Build dictionary of {parameter_name: value}
     config = {item['index']: val for item, val in zip(ids, values)}
 
     print("Changes Applied")  # for debugging
 
-    #Save changes in a file in the simulator folder as custom_sim_params.xml, just save the dict.
-    current_sim_folder = Path(current_sim).parent
-    config_file_path = current_sim_folder / "custom_sim_params.xml"
-    with open(config_file_path, "w") as f:
-        f.write(str(config))
+    pipeline.save_simulator_config(current_sim, config)
     return config

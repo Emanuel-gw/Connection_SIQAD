@@ -1,31 +1,16 @@
-from ast import expr
-import csv
-import json
-import dash
-from dash import clientside_callback, html, dcc, callback, Input, Output, State, dash_table
-from importlib_metadata import files
-import matplotlib
-from matplotlib import pyplot as plt
-import plotly.express as px
-import plotly.graph_objects as go
-import pandas as pd
-import numpy as np
-import dash_bootstrap_components as dbc
-from source import corrector
-from source import file_manager, sqd_manipulator, gate_connector, StreamCapture, implementation
-from source.plotting import plot_NML, get_top_size, get_bottom_size, get_viewport, viewport_size, plot_XY
 import os
 import time
-from pages import configpage
-from dash import ClientsideFunction
 from pathlib import Path
-from sympy.logic.boolalg import truth_table
-from sympy import symbols
-from itertools import product
-import csv
-from datetime import datetime
 
-matplotlib.use("Agg")
+import dash
+import dash_bootstrap_components as dbc
+from dash import Input, Output, State, callback, clientside_callback, dash_table, dcc, html
+
+from pages import configpage
+from source import StreamCapture, exporter, pipeline
+from source.pipeline import is_valid_combo
+from source.plotting import get_viewport, plot_NML, plot_XY, viewport_size
+
 data_temp = Path("data") / "temp"
 data_xml = Path("data") / "xml"
 data_simulators = Path("data") / "simulators"
@@ -189,40 +174,21 @@ def update_fixes_allowed(value):
 def update_gate_view(_,__, ___, selected_gates, files_data, wire_lenght, algorithm):
     if not selected_gates or not files_data:
         return placeholder_fig, None
-    fig = placeholder_fig
-    original_wire_lenght = wire_lenght
-    #Print JUST the names
     gate_names = [os.path.basename(gate) for gate in selected_gates]
-    gate_pos_name = None
     files = selected_gates
-    
-    if not is_valid_combo(files, 999999999):
-        print("⚠️ Invalid gate combination selected.")
+
+    try:
+        connection = pipeline.connect_gates(files, wire_length=wire_lenght, strategy=algorithm)
+    except (ValueError, NotImplementedError) as exc:
+        print(f"⚠️ {exc}")
         return placeholder_fig, None
 
-    if(algorithm == "CORNER"):
-        circuit = gate_connector.connect_n_gates(files, wires=wire_lenght)
-    else:
-        overlap_try = 0
-        while(True):
-            circuit, gate_pos_name, metadata, overlaps = gate_connector.connect_n_gates(files, wires=wire_lenght, strategy=algorithm)
-            overlap_try += 1
-            if overlap_try == len(selected_gates) * 3:
-                print(f"⚠️ Maximum attempts to stop overlapping done... Resetting wire lenght. Current Gate might not be supported on this architecture.")
-                wire_lenght = original_wire_lenght
-            if not overlaps or overlap_try > len(selected_gates) * 3:
-                break
-            wire_lenght += 1
-    gate = sqd_manipulator.circuit_to_gate(circuit)
-
-    #Store the gate metadata in the gate
-    gate.gate_metadata = metadata
-        
+    gate = connection.gate
     viewport = get_viewport(gate)
-    fig = plot_NML(gate, viewport, len(selected_gates), gate_pos_name)
-    print(f"Selected gates: {gate_names}, Wire length: {wire_lenght}, {viewport_size(viewport)}")
+    fig = plot_NML(gate, viewport, len(selected_gates), connection.gate_pos_name)
+    print(f"Selected gates: {gate_names}, Wire length: {connection.wire_length}, {viewport_size(viewport)}")
     print(f"Gate expression: {gate.expression}")
-    
+
     return fig, gate.to_dict()
 
 @callback(
@@ -232,10 +198,7 @@ def update_gate_view(_,__, ___, selected_gates, files_data, wire_lenght, algorit
 )
 
 def load_files(_, __):
-    file_path_string = str(data_sqd)
-    files = file_manager.get_files(file_path_string)
-
-    return files  # This will be a list of file paths
+    return pipeline.discover_gate_files(data_sqd)  # This will be a list of file paths
 
 @callback(
     Output('gate-dropdown', 'options'),
@@ -282,177 +245,26 @@ def store_selected_gate(button1, button2, button3, selected_gate, stored):
     State('fixes-allowed-store', 'data'),
 )
 def simulate_circuit(n_clicks, gate, current_sim, config_sim, max_corrections=0, called_from_callback=True, max_mismatches=1):
-    #print(max_corrections)
-    if not gate:
-        #Create a padded empty table
-        blank_row = {"result": "", "expected": "", "file_id": "", "energy": ""}
-        data = [blank_row.copy() for _ in range(20)]
-        return data, []
-    temp_string = str(data_temp)
-    xml_string = str(data_xml)
-    file_manager.clear_folder(temp_string)
-    file_manager.clear_folder(xml_string)
-
-    if(isinstance(gate, dict)):
-        gate = sqd_manipulator.Gate.from_dict(gate)
-        
-    expected = []
-
-    for values, output in truth_table(gate.expression, gate.input_symbols):
-        expected.append(int(bool(output)))
-
-    if current_sim is None:
-        sim = simmanneal_default_path
-    else:
-        sim = current_sim
-
-    # cleanup sim
-    if(os.name == 'posix'):
-        sim = sim.replace(".physeng", "")
-    elif(os.name == 'nt'):
-        sim = sim.replace(".physeng", ".exe")
-    applied_corrections = 0
-
-    max_possible_corrections = len(gate.gate_metadata)
-    if(max_corrections > max_possible_corrections):
-        max_corrections = max_possible_corrections
-    print(f"Simulator: {sim}, gate: {gate.name}")
-    while(True):
-        Results, specific_gate_data, corrections_needed = simulate_internal(gate, sim, config_sim, expected, max_mismatches=max_mismatches, called_from_callback=called_from_callback)
-        if(corrections_needed and applied_corrections < max_corrections):
-            print("⚠️ Corrections needed, applying corrections...")
-            gate, max_stabilized = corrector.main_correction(gate, gate.gate_metadata, specific_gate_data)
-            applied_corrections += 1
-            if max_stabilized:
-                print("⚠️ Maximum current stabilization achieved, stopping further corrections.")
-                break
-        elif(corrections_needed and applied_corrections >= max_corrections):
-            print("⚠️ Maximum corrections applied, stopping further corrections.")
-            break
-        else:
-            break
-
-    #for m in gate.gate_metadata:
-    #    print(m)
-    #    print("")
-    #print(implementation.make_table(["Result", gate.name, "Energy"], Results))
-
-    columns = ["Result", "Expected", "File_ID", "Energy"]
-
-    def clean(val):
-        if isinstance(val, (int, float, str, bool)) or val is None:
-            return val
-        return str(val)  # fallback to string
-
-    data = [
-    {
-        "result": clean(row[0]),
-        "expected": "N/A" if row[1] >= len(expected) else clean(expected[row[1]]),
-        "file_id": clean(row[1]),
-        "energy": clean(row[2]),
-    }
-    for row in Results
-    ]
-
-    separate_results = False
-    for item in data:
-        result_val = str(item["result"])
-        #clean result_Val from ["0"] to 0
-        if result_val.startswith('[') and result_val.endswith(']'):
-            result_val = result_val.strip('[]')
-            result_val = result_val.strip().strip("'").strip('"')
-        expected_val = str(item["expected"])
-        
-        if expected_val != "N/A" and result_val != expected_val:
-            item["expected"] = f"{expected_val} 🔴"
-            separate_results = True
-
-    def pad_table_data(data, page_size=20):
-        # If there are fewer rows than page size, fill with blanks
-        rows_to_add = page_size - len(data) % page_size
-        if rows_to_add > 0:
-            blank_row = {col: "" for col in data[0].keys()} if data else {"result": "", "expected": "", "file_id": "", "energy": ""}
-            data += [blank_row.copy() for _ in range(rows_to_add)]
-        return data
-    
-    data = pad_table_data(data, page_size=20)
+    sim_result = pipeline.run_simulation(
+        gate,
+        simulator=current_sim,
+        config_sim=config_sim,
+        max_corrections=max_corrections,
+        max_mismatches=max_mismatches,
+        pad_page_size=20,
+        verbose=called_from_callback,
+    )
 
     if called_from_callback:
-        print("Simulation completed.")
-        return data, specific_gate_data
-    else:
-        #print("Simulation completed (not from callback).")
-        return data, specific_gate_data, separate_results, False
-
-def simulate_internal(gate, sim, config_sim, expected, max_mismatches=1, called_from_callback=True):
-    corrections_needed = False
-    Results = []
-    specific_gate_data = []
-    gates = sqd_manipulator.combinators(gate)
-    if called_from_callback:
-        print(f"Total simulations to run: {len(gates)}")
-    percentage_print = max(1, len(gates) // 8)
-
-    print("Progress: [", end='', flush=True)
-    sim_template = file_manager.gen_simulator_sim_template(simulator_path=sim)
-    if sim_template is None:
-        sim_template = file_manager.get_simulator_sim_template(sim)
-    if sim_template is None:
-        print("No sim template found, Aborting.")
-        return [], []
-
-    max_retries = 3
-    retry_sleep = 5
-
-    mismatches_found = 0
-    for i in range(len(gates)):
-        attempts = 0
-        if mismatches_found >= max_mismatches:
-            break
-        while attempts < max_retries:
-            try:
-                file_name, template = file_manager.sqd_template_create(gates[i], prefix=f"combination_{i}_", mode="simulation", sim_params_template=sim_template, parameters=config_sim)
-                file_path = str(data_temp / file_name)
-                file_manager.make_file(file_path, template)
-                result_name = "result_" + file_name
-                #print(">>>>>", result_name)
-                result_path = implementation.call_sim(file_path, result_name, simulator=sim, simmaneal_default_path=simmanneal_default_path)
-                #print("Result path: " + result_path)
-                #print(f"\nReading result for simulation {i} from {result_path}...")
-                #print(gate)
-                symbol_table, energy = sqd_manipulator.read_result(result_path, gate)
-                specific_gate_data.append(sqd_manipulator.read_result_plusXY(result_path, gate))
-                Results.append([symbol_table, i, energy])
-                symbol_value = int(symbol_table[0])
-                expected_value = expected[i]
-                if symbol_value != expected_value:
-                    mismatches_found += 1
-                break
-            except Exception as e:
-                attempts += 1
-                print(f"\n ⚠️ Error reading result for simulation {i}: {e}")
-                if attempts < max_retries:
-                    print(f"Retrying ({attempts}/{max_retries}) after {retry_sleep} seconds...")
-                    time.sleep(retry_sleep)
-                else:
-                    print(f"Max retries reached for simulation {i}. Skipping this simulation.")
-                    symbol_table, energy = "Error", "Error"
-                    Results.append([symbol_table, i, energy])
-                    if called_from_callback:
-                        blank_row = {"result": "", "expected": "", "file_id": "", "energy": ""}
-                        data = [blank_row.copy() for _ in range(20)]
-                        return data, []
-                    else:
-                        return [], [], True, True  # Indicate failure
-        if i % percentage_print == 0:
-                print(f"#", end='', flush=True)
-    
-    print("]")    
-    if mismatches_found >= max_mismatches:
-        print(f"⚠️ Maximum mismatches reached ({max_mismatches}). Stopping further simulations.")
-        corrections_needed = True
-
-    return Results, specific_gate_data, corrections_needed
+        if gate and not sim_result.failed:
+            print("Simulation completed.")
+        return sim_result.table_data, sim_result.specific_gate_data
+    return (
+        sim_result.table_data,
+        sim_result.specific_gate_data,
+        sim_result.has_mismatches,
+        sim_result.failed,
+    )
 
 @callback(
     Output('gate-slider', 'max'),
@@ -535,65 +347,14 @@ def save_current(n_clicks, table_data, specific_gate_data, gate_storage, sim_sto
     if not table_data or not specific_gate_data:
         print("⚠️ No data to save.")
         return
-    
-    #Get a name for the gate and make a folder for it on data/saved
-    gate = sqd_manipulator.Gate.from_dict(gate_storage)
-    gate_name = gate.name if gate.name else "unnamed_gate"
-    save_folder = Path("data") / "saved" / gate_name
-    save_folder.mkdir(parents=True, exist_ok=True)
 
-    # Save truth table as PNG
-    circuit_name = gate_name + "_truth_table"
-    expression_name = gate.expression 
-    simulator_name = sim_store if sim_store else "default_simanneal"
-    df = pd.DataFrame(table_data)
-    fig, ax = plt.subplots(figsize=(len(df.columns)*1.5, len(df)/2))
-    ax.axis('off')
-    ax.axis('tight')
-
-    # Add a title with the circuit and expression names
-    plt.title(f"Circuit: {circuit_name}\nExpression: {expression_name}", fontsize=14, pad=20)
-    table = ax.table(
-        cellText=df.values,
-        colLabels=df.columns,
-        loc='center',
-        cellLoc='center'
+    exporter.save_simulation_results(
+        gate_storage,
+        table_data,
+        specific_gate_data,
+        simulator_name=sim_store,
+        config_sim=config_sim_store,
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 1.2)
-
-    plt.savefig(save_folder / "truth_table.png", dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    print(f"✅ Truth table saved: {save_folder / 'truth_table.png'}")
-
-    # Save specific gate data plot as PNG
-    for i, gate_info in enumerate(specific_gate_data):
-        # Convert plot_XY data manually
-        x_coords = [dot[0] for dot in gate_info]
-        y_coords = [dot[1] for dot in gate_info]
-        colors = ['black' if dot[2] == '0' else 'blue' for dot in gate_info]
-        markers = ['o' if dot[2] == '1' else 'o' for dot in gate_info]
-
-        plt.figure(figsize=(6, 6))
-        for x, y, c in zip(x_coords, y_coords, colors):
-            plt.scatter(x, y, color=c, s=60, edgecolors='none')
-        plt.gca().invert_yaxis()
-        plt.axis('off')
-        plt.tight_layout()
-
-        plt.savefig(save_folder / f"specific_gate_{i}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-    print(f"✅ Gate data plots saved under {save_folder}")
-
-    #Save the configuration used for the simulation
-    config_file_path = save_folder / "simulation_config.txt"
-    with open(config_file_path, "w") as f:
-        f.write(f"Simulator: {simulator_name}\n")
-        f.write(f"Configuration Parameters:\n")
-        for key, value in config_sim_store.items():
-            f.write(f"{key}: {value}\n")
-    print(f"✅ Simulation configuration saved: {config_file_path}")
 
 @callback(
     Input('auto-batch-button', 'n_clicks'),
@@ -604,7 +365,6 @@ def save_current(n_clicks, table_data, specific_gate_data, gate_storage, sim_sto
 )
 
 def auto_batch_simulation(n_clicks, files_data, current_sim, config_sim_store):
-
     if n_clicks is None or n_clicks <= 0:
         return
 
@@ -612,288 +372,17 @@ def auto_batch_simulation(n_clicks, files_data, current_sim, config_sim_store):
         print("⚠️ No files to process for auto batch.")
         return
 
-    print("Starting auto batch simulation for all gates...")
-
-    gate_unique_expressions = {}
-    expressions_file = Path("data/auto_batch_results") / "saved_expressions.json"
-
-    
-
-    if os.path.exists(expressions_file):
-        with open(expressions_file, "r") as f:
-            saved = json.load(f)
-            # Convert strings back to SymPy expressions if necessary
-            from sympy import sympify
-            gate_unique_expressions = {sympify(k): True for k in saved.keys()}
-        print(f"✅ Reloaded {len(gate_unique_expressions)} saved unique expressions")
-    else:
-        print("No saved expressions found. Starting fresh.")
-
-    #Prepare CSV
-    summary_csv_path = Path("data/auto_batch_results") / "summary.csv"
-    summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    wire_length = 1  # Default wire length
-    last_num_gates = 1
-    all_combos = []
-    max_size = 5
-    max_len = 2 * max_size # Worst case is GATE - INPUT - GATE - INPUT .... which means K = 2 * size - 1. We do not do -1 because the following generation does [1, max_len) and not [1, max_len]
-    for r in range(1, max_len):  
-        all_combos.extend(list(product(files_data, repeat=r)))
-
-    def normalize_combo(combo):
-        """Return tuple of just the gate filenames (order preserved)."""
-        return tuple(os.path.basename(g) for g in combo)
-    
-    def canonicalize_expression(expr):
-        mapping = {}
-        counter = 0
-
-        # deterministic ordering of symbols
-        ordered_symbols = sorted(expr.free_symbols, key=lambda s: str(s))
-
-        for s in ordered_symbols:
-            mapping[s] = symbols(f"x{counter}")
-            counter += 1
-
-        return expr.xreplace(mapping)
-
-    def is_unique_combo(combo, generator_unique_expressions, canonicalize=True):
-        """Check if the combo is unique based on its expression."""
-        circuit, _, _, _ = gate_connector.connect_n_gates(combo, wires=wire_length)
-        gate = sqd_manipulator.circuit_to_gate(circuit)
-        if canonicalize:
-            expr_key = canonicalize_expression(gate.expression)
-        else:
-            expr_key = gate.expression
-
-        if expr_key in generator_unique_expressions:
-            #print(f"⚠️ Duplicate expression found, skipping combination {[os.path.basename(g) for g in combo]}. Expression: {gate.expression}")
-            return False
-        generator_unique_expressions[expr_key] = True
-        return True
-    
-    seen = set()
-    unique_combos = []
-    generator_unique_expressions = {}
-
-    for combo in all_combos:
-        if not is_valid_combo(combo, max_size):
-            continue
-    
-        norm = normalize_combo(combo)
-        #check if the combo is unique based on its expression
-        if not is_unique_combo(combo, generator_unique_expressions):
-            continue
-        if norm not in seen:
-            seen.add(norm)
-            unique_combos.append(combo)    
-
-    group_sizes = []
-    #We have to count based on the number of gates (minus INPUT)
-    for combo in unique_combos:
-        num_gates = sum(1 for g in combo if os.path.basename(g) != "INPUT.sqd")
-        #print(f"Combo: {[os.path.basename(g) for g in combo]}, Gates: {num_gates}")
-
-        while len(group_sizes) < num_gates:
-            group_sizes.append(0)
-        group_sizes[num_gates - 1] += 1
-
-
-    for size, count in enumerate(group_sizes):
-        print(f"Total {size+1}-gate combinations: {count}")
-    current_group = 0
-
-    #all_combos = single_gates + two_gate_combos + three_gate_combos + four_gate_combos + five_gate_combos
-    print(f"Approximate Total combinations to simulate: {len(unique_combos)}")
-    print("Note: The actual number may be lower due to invalid combinations or logical duplicates being skipped.")
-    file_exists = summary_csv_path.exists()
-    with open(summary_csv_path, mode='a', newline='') as csv_file:
-        csv_writer = csv.DictWriter(csv_file, fieldnames=['RowType', 'Combination', 'Expression', 'Num_Gates', 'Mismatch', 'Timestamp', 'Runtime_s'])
-        if not file_exists:
-            csv_writer.writeheader()
-        total_combinations = 0
-        total_mismatches = 0
-        completed_combos = set()
-        if(file_exists):
-            with open(summary_csv_path, mode='r') as read_file:
-                csv_reader = csv.DictReader(read_file)
-                for row in csv_reader:
-                    if not row.get('RowType'):
-                        continue
-                    if row['RowType'] != 'DATA':
-                        continue
-                    combo_name = row.get('Combination', '').strip()
-                    if not combo_name:
-                        continue
-                    completed_combos.add(combo_name)
-                    total_combinations += 1
-                    if row['Mismatch'] == 'TRUE':
-                        total_mismatches += 1
-
-            print(f"❗ Found {len(completed_combos)} completed combinations. Resuming from last progress... ❗")
-            print(f"Total combinations so far: {total_combinations}, with mismatches: {total_mismatches}")
-            mismatch_percentage = (total_mismatches / total_combinations * 100) if total_combinations > 0 else 0
-            print(f"Mismatch percentage so far: {mismatch_percentage:.2f}%")
-        else:
-            print("Starting fresh auto batch simulation.")
-
-        #Time storage for calculations
-        original_wire_length = wire_length
-        for combo in unique_combos:  
-            wire_length = original_wire_length
-            if(len(combo) != last_num_gates):
-                #print(f"❗ Now processing {len(combo)}-gate combinations ❗")
-                csv_file.flush()
-                last_num_gates = len(combo)    
-            selected_gates = combo
-
-            combo_name = "_".join([os.path.basename(g) for g in selected_gates])
-            if combo_name in completed_combos:
-                print(f"⚠️ Skipping already completed combination: {combo_name}")
-                continue
-
-            starting_time = time.time()
-
-            # Connect gates using FIFO algorithm
-            #print("DEBUG: selected_gates:", selected_gates)
-            original_wire_length = wire_length
-            overlap_try = 0
-            while(True):
-                circuit, gate_pos_name, gate_metadata,overlaps = gate_connector.connect_n_gates(selected_gates, wires=wire_length)
-                overlap_try += 1
-                if overlap_try == len(selected_gates) * 3:
-                    print(f"⚠️ Maximum attempts to stop overlapping done... Resetting wire length. Current Gate might not be supported on this architecture.")
-                    wire_length = original_wire_length
-                if not overlaps or overlap_try > len(selected_gates) * 3:
-                    break
-                wire_length += 1
-
-
-            
-            gate = sqd_manipulator.circuit_to_gate(circuit)
-            gate.gate_metadata = gate_metadata
-
-            #Prum the gates that have the SAME expression;
-            if gate.expression in gate_unique_expressions:
-                print(f"⚠️ Duplicate expression found, skipping simulation for {[os.path.basename(g) for g in selected_gates]}. Expression: {gate.expression}")
-                continue
-            
-            gate_unique_expressions[gate.expression] = True
-
-            # Simulate the gate
-            data, specific_gate_data, separate_results, failed = simulate_circuit(None, gate, current_sim, config_sim_store,max_corrections=5, called_from_callback=False, max_mismatches=1)
-            
-            #Write summary to CSV
-            total_combinations += 1
-            if separate_results:
-                total_mismatches += 1
-
-            end_time = time.time()
-            runtime_s = end_time - starting_time
-            num_real_gates = sum(1 for g in selected_gates if os.path.basename(g) != "INPUT.sqd")
-            csv_row = {
-                'RowType': 'DATA' if not failed else 'ERROR',
-                'Combination': "_".join([os.path.basename(g) for g in selected_gates]),
-                'Expression': str(gate.expression) if not failed else "N/A",
-                'Num_Gates': num_real_gates,
-                'Mismatch': 'TRUE' if separate_results else 'FALSE',
-                'Timestamp': datetime.now().isoformat(),
-                'Runtime_s': f"{runtime_s:.2f}"
-            }
-
-
-            csv_writer.writerow(csv_row)
-            csv_file.flush()
-
-            with open(expressions_file, "w") as f:
-                # Dump the current state of gate_unique_expressions
-                json.dump({str(k): True for k in gate_unique_expressions.keys()}, f)
-           
-            # Save results just like the save_current function
-            gate_name = gate.name if gate.name else f"unnamed_gate{str(combo)}"
-            #Get the number of gates
-
-            if separate_results:
-                num_gates = f"{len(selected_gates)}_with_mismatches"
-            else:
-                num_gates = str(len(selected_gates))
-                
-            save_folder = Path("data") / "auto_batch_results" / f"{num_gates}" / gate_name
-            save_folder.mkdir(parents=True, exist_ok=True)
-
-            # Save truth table as PNG
-            circuit_name = gate_name + "_truth_table"
-            expression_name = gate.expression
-            simulator_name = current_sim if current_sim else "default_simanneal"
-            df = pd.DataFrame(data)
-            fig, ax = plt.subplots(figsize=(len(df.columns)*1.5, len(df)/2))
-            ax.axis('off')
-            ax.axis('tight')
-
-            # Add a title with the circuit and expression names
-            plt.title(f"Circuit: {circuit_name}\nExpression: {expression_name}", fontsize=14, pad=20)
-            table = ax.table(
-                cellText=df.values,
-                colLabels=df.columns,
-                loc='center',
-                cellLoc='center'
-            )
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1.2, 1.2)
-
-            plt.savefig(save_folder / f"{circuit_name}_truth_table.png", dpi=300, bbox_inches='tight')
-            plt.close(fig)
-
-            # Save specific gate data plot as PNG ONLY on mismatch
-            if(separate_results):
-                for i, gate_info in enumerate(specific_gate_data):
-                    # Convert plot_XY data manually
-                    x_coords = [dot[0] for dot in gate_info]
-                    y_coords = [dot[1] for dot in gate_info]
-                    colors = ['black' if dot[2] == '0' else 'blue' for dot in gate_info]
-                    markers = ['o' if dot[2] == '1' else 'o' for dot in gate_info]
-
-                    plt.figure(figsize=(6, 6))
-                    for x, y, c in zip(x_coords, y_coords, colors):
-                        plt.scatter(x, y, color=c, s=60, edgecolors='none')
-                    plt.gca().invert_yaxis()
-                    plt.axis('off')
-                    plt.tight_layout()
-
-                    plt.savefig(save_folder / f"specific_gate_{i}.png", dpi=300, bbox_inches='tight')
-                    plt.close()
-
-            config_file_path = save_folder / "simulation_config.txt"
-            with open(config_file_path, "w") as f:
-                f.write(f"Simulator: {simulator_name}\n")
-                f.write(f"Configuration Parameters:\n")
-                for key, value in config_sim_store.items():
-                    f.write(f"{key}: {value}\n")
-
-            if separate_results:
-                print(f"✅ Completed simulation and saving for combination: {[os.path.basename(g) for g in selected_gates]} ⚠️ mismatch found")
-            else:
-                print(f"✅ Completed simulation and saving for combination: {[os.path.basename(g) for g in selected_gates]}")
-            
-            time_to_sleep = max(0.2, len(selected_gates) - 1)
-            time_to_sleep = min(time_to_sleep, 2.0)
-            time.sleep(time_to_sleep)  # Sleep to avoid overloading the simulator
-            final_runtime = time.time() - starting_time
-            print(f"⏲ Runtime: {final_runtime:<.2f}s")
-            
-
-
-        # After all combinations, calculate mismatch statistics
-        mismatch_percentage = (total_mismatches / total_combinations * 100) if total_combinations > 0 else 0
-        csv_writer.writerow({'RowType': 'SUMMARY', 'Combination': 'TOTAL_COMBINATIONS', 'Num_Gates': total_combinations, 'Mismatch': False})
-        csv_writer.writerow({'RowType': 'SUMMARY', 'Combination': 'TOTAL_MISMATCHES',   'Num_Gates': total_mismatches,   'Mismatch': False})
-        csv_writer.writerow({'RowType': 'SUMMARY', 'Combination': 'MISMATCH_PERCENTAGE','Num_Gates': f"{mismatch_percentage:.2f}%", 'Mismatch': False})
-
-  
-
-    print("✅ Auto batch simulation completed for all gates.")
+    pipeline.run_batch_simulation(
+        gate_files=files_data,
+        max_gates=5,
+        connector="FIFO",
+        simulator=current_sim,
+        config_sim=config_sim_store,
+        wire_length=1,
+        max_corrections=5,
+        max_mismatches=1,
+        cooldown=True,
+    )
 
 @callback(
     Input('save-gate-button', 'n_clicks'),
@@ -909,43 +398,4 @@ def save_gate(button, gate):
         print("⚠️ No files to select for saving gate.")
         return
 
-    if(isinstance(gate, dict)):
-        gate = sqd_manipulator.Gate.from_dict(gate)
-
-    gate_name = gate.name if gate.name else "unnamed_gate"
-    save_folder = Path("data") / "saved_gates"
-    save_folder.mkdir(parents=True, exist_ok=True)
-    gate_file_path = save_folder / f"{gate_name}.sqd"
-    with open(gate_file_path, "w") as f:
-        name, template = file_manager.sqd_template_create(gate, prefix=gate_name + "_", mode="save")
-        #print(template)
-        f.write(template)
-    print(f"✅ Gate saved: {gate_file_path}")
-    
-def is_valid_combo(combo, max_size):
-    INPUT_NAME = "INPUT.sqd"
-    names = [os.path.basename(g) for g in combo]
-
-    # 1) Cannot start with INPUT
-    if INPUT_NAME in names[0]:
-        return False
-
-    # 2) We need to analyse the gates names one by one. For each gate after the first one for now, we add 2 to inputs, and subtract one from the available inputs. If at any point we get 0 available inputs and we still have gates to process, it means the combination is not valid. This is a very rough approximation but it works decently for small combinations and filters out a lot of invalid ones.
-    available_slots = 1 # Root has one Available slot;
-    for name in names:
-        if available_slots <= 0:
-            return False
-
-        # consume one open slot (we are filling a parent slot)
-        available_slots -= 1
-
-        if name != INPUT_NAME:
-            # INPUT are leaf nodes, they don't open new slots
-            available_slots += 2
-
-    # 3) We can also set a maximum size for the combinations to avoid simulating very large and likely invalid combinations. This is especially useful for the auto batch feature.
-    #we remove INPUT from the count as they don't add complexity to the circuit
-    non_input_count = sum(1 for name in names if name != INPUT_NAME)
-    if non_input_count > max_size:
-        return False
-    return True
+    exporter.save_gate_sqd(gate)
